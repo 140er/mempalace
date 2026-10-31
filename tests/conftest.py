@@ -8,13 +8,21 @@ HOME is redirected to a temp directory at module load time — before any
 mempalace imports — so that module-level initialisations (e.g.
 ``_kg = KnowledgeGraph()`` in mcp_server) write to a throwaway location
 instead of the real user profile.
+
+Module-level code, hooks and autouse fixtures here never import mempalace or
+commonplace: autouse fixtures act on such a module only once a test has loaded
+it (``_when_imported``), and the fixtures that build mempalace objects import
+them in their own bodies. A test then depends only on the modules it uses,
+which keeps the test-impact picture of a change honest.
 """
 
 import hashlib
+import importlib.abc
 import math
 import os
 import re
 import shutil
+import sys
 import tempfile
 from contextlib import ExitStack
 
@@ -34,9 +42,6 @@ os.environ.pop("XDG_CONFIG_HOME", None)
 # Now it is safe to import mempalace modules that trigger initialisation.
 import chromadb  # noqa: E402
 import pytest  # noqa: E402
-
-from mempalace.config import MempalaceConfig  # noqa: E402
-from mempalace.knowledge_graph import KnowledgeGraph  # noqa: E402
 
 _TEST_EMBED_DIM = 384
 _TEST_TOKEN_RE = re.compile(r"\w+", re.UNICODE)
@@ -116,6 +121,60 @@ except ImportError:
     pass
 
 
+class _AfterImport(importlib.abc.MetaPathFinder):
+    """Runs callbacks right after a pending module is first imported."""
+
+    def __init__(self):
+        self.pending = {}
+
+    def find_spec(self, fullname, path, target=None):
+        # Callbacks leave ``pending`` only once the module has run, so a bare
+        # spec lookup or a failed import keeps them for the real import.
+        if not self.pending.get(fullname):
+            return None
+        for finder in sys.meta_path:
+            find = getattr(finder, "find_spec", None)
+            spec = find(fullname, path, target) if finder is not self and find else None
+            if spec is not None:
+                break
+        else:
+            return None
+        loader = spec.loader
+        if not hasattr(loader, "exec_module"):
+            return spec
+
+        def exec_then_apply(module):
+            del loader.exec_module  # back to the class method, for this import only
+            loader.exec_module(module)
+            # A raising callback fails the import with the entry already gone,
+            # as a failing patch in fixture setup failed the test before.
+            for callback in self.pending.pop(fullname, ()):
+                callback(module)
+
+        loader.exec_module = exec_then_apply
+        return spec
+
+
+_after_import = _AfterImport()
+sys.meta_path.insert(0, _after_import)
+
+
+def _when_imported(monkeypatch, name, apply):
+    """Call ``apply(module)`` for ``name`` now if it is loaded, else when the test imports it.
+
+    Autouse fixtures use this instead of importing the module themselves, so a
+    test that never loads ``name`` neither loads nor depends on it. The pending
+    callback is dropped at teardown through ``monkeypatch``.
+    """
+    module = sys.modules.get(name)
+    if module is not None:
+        apply(module)
+    else:
+        monkeypatch.setitem(
+            _after_import.pending, name, _after_import.pending.get(name, []) + [apply]
+        )
+
+
 @pytest.fixture(autouse=True)
 def _stable_embedding_function_for_tests(request, monkeypatch):
     """Keep ordinary tests off ChromaDB's native ONNX embedding path.
@@ -134,19 +193,29 @@ def _stable_embedding_function_for_tests(request, monkeypatch):
 
     from chromadb.api.types import DefaultEmbeddingFunction
 
-    import mempalace.backends.chroma as chroma_mod
-    import mempalace.backends.embedding_wrapper as embedding_wrapper
-    import mempalace.embedding as embedding_mod
-
     monkeypatch.setattr(DefaultEmbeddingFunction, "__call__", lambda self, input: ef(input=input))
     monkeypatch.setattr(
         DefaultEmbeddingFunction, "embed_query", lambda self, input: ef(input=input)
     )
-    monkeypatch.setattr(embedding_mod, "get_embedding_function", lambda *_, **__: ef)
-    monkeypatch.setattr(
-        chroma_mod.ChromaBackend, "_resolve_embedding_function", staticmethod(lambda **_: ef)
+    _when_imported(
+        monkeypatch,
+        "mempalace.embedding",
+        lambda mod: monkeypatch.setattr(mod, "get_embedding_function", lambda *_, **__: ef),
     )
-    monkeypatch.setattr(embedding_wrapper, "_embed_texts", lambda texts, **_: ef(input=list(texts)))
+    _when_imported(
+        monkeypatch,
+        "mempalace.backends.chroma",
+        lambda mod: monkeypatch.setattr(
+            mod.ChromaBackend, "_resolve_embedding_function", staticmethod(lambda **_: ef)
+        ),
+    )
+    _when_imported(
+        monkeypatch,
+        "mempalace.backends.embedding_wrapper",
+        lambda mod: monkeypatch.setattr(
+            mod, "_embed_texts", lambda texts, **_: ef(input=list(texts))
+        ),
+    )
     yield
 
 
@@ -188,14 +257,23 @@ def _close_test_storage_clients(monkeypatch):
     """
     from chromadb.api.client import Client
 
-    from commonplace.control_db import ControlDB
-    from mempalace.backends import _inproc_sqlite, _magic
-    from mempalace.backends.sqlite_exact import SQLiteExactBackend
+    # The mempalace and commonplace modules are bound once they load (see
+    # ``_when_imported``), with the state they had then, so a test that never
+    # loads them neither imports nor depends on them.
+    before = {}
 
-    probes_before = dict(_magic._retained_conns)
-    anchors_before = dict(_inproc_sqlite._anchors)
-    holders_before = dict(_inproc_sqlite._holders)
-    positives_before = set(_magic._positive)
+    def remember_magic(magic):
+        before["magic"] = magic
+        before["probes"] = dict(magic._retained_conns)
+        before["positives"] = set(magic._positive)
+
+    def remember_inproc(inproc):
+        before["inproc"] = inproc
+        before["anchors"] = dict(inproc._anchors)
+        before["holders"] = dict(inproc._holders)
+
+    _when_imported(monkeypatch, "mempalace.backends._magic", remember_magic)
+    _when_imported(monkeypatch, "mempalace.backends._inproc_sqlite", remember_inproc)
     resources = ExitStack()
 
     def live_databases():
@@ -218,25 +296,31 @@ def _close_test_storage_clients(monkeypatch):
         return paths, inodes
 
     def close_anchors():
+        inproc = before.get("inproc")
+        if inproc is None:
+            return
         live_paths, _ = live_databases()
         for current, previous in (
-            (_inproc_sqlite._anchors, anchors_before),
-            (_inproc_sqlite._holders, holders_before),
+            (inproc._anchors, before["anchors"]),
+            (inproc._holders, before["holders"]),
         ):
             for path, handle in list(current.items()):
                 if previous.get(path) is not handle and path not in live_paths:
-                    _inproc_sqlite.release(path)
+                    inproc.release(path)
 
     def close_probes():
+        magic = before.get("magic")
+        if magic is None:
+            return
         _, live_inodes = live_databases()
-        with _magic._lock:
-            for key, connection in list(_magic._retained_conns.items()):
-                if probes_before.get(key) is connection or key in live_inodes:
+        with magic._lock:
+            for key, connection in list(magic._retained_conns.items()):
+                if before["probes"].get(key) is connection or key in live_inodes:
                     continue
                 connection.close()
-                _magic._retained_conns.pop(key)
-            for key in set(_magic._positive) - positives_before - live_inodes:
-                _magic._positive.pop(key, None)
+                magic._retained_conns.pop(key)
+            for key in set(magic._positive) - before["positives"] - live_inodes:
+                magic._positive.pop(key, None)
 
     # ExitStack attempts every callback even when a client close raises.
     # Its reverse order keeps clients before probes, then releases anchors.
@@ -244,36 +328,44 @@ def _close_test_storage_clients(monkeypatch):
     resources.callback(close_probes)
     palaces = set()
     original_client_init = Client.__init__
-    original_control_init = ControlDB.__init__
-    original_connect = SQLiteExactBackend._connect
 
     def tracked_client_init(client, *args, **kwargs):
         original_client_init(client, *args, **kwargs)
         resources.callback(client.close)
 
-    def tracked_control_init(database, *args, **kwargs):
-        original_control_init(database, *args, **kwargs)
-        resources.callback(database.close)
+    def track_control_db(control_db):
+        original_init = control_db.ControlDB.__init__
 
-    def tracked_connect(backend, palace_path, *args, **kwargs):
-        already_open = any(
-            handle is not None and not handle.closed
-            for handle in (
-                backend._clients.get(palace_path),
-                backend._read_only_clients.get(palace_path),
+        def tracked_control_init(database, *args, **kwargs):
+            original_init(database, *args, **kwargs)
+            resources.callback(database.close)
+
+        monkeypatch.setattr(control_db.ControlDB, "__init__", tracked_control_init)
+
+    def track_sqlite_exact(sqlite_exact):
+        original_connect = sqlite_exact.SQLiteExactBackend._connect
+
+        def tracked_connect(backend, palace_path, *args, **kwargs):
+            already_open = any(
+                handle is not None and not handle.closed
+                for handle in (
+                    backend._clients.get(palace_path),
+                    backend._read_only_clients.get(palace_path),
+                )
             )
-        )
-        result = original_connect(backend, palace_path, *args, **kwargs)
-        key = (id(backend), palace_path)
-        if not already_open and key not in palaces:
-            palaces.add(key)
-            # Release handles without closing the reusable registry backend.
-            resources.callback(backend.close_palace, palace_path)
-        return result
+            result = original_connect(backend, palace_path, *args, **kwargs)
+            key = (id(backend), palace_path)
+            if not already_open and key not in palaces:
+                palaces.add(key)
+                # Release handles without closing the reusable registry backend.
+                resources.callback(backend.close_palace, palace_path)
+            return result
+
+        monkeypatch.setattr(sqlite_exact.SQLiteExactBackend, "_connect", tracked_connect)
 
     monkeypatch.setattr(Client, "__init__", tracked_client_init)
-    monkeypatch.setattr(ControlDB, "__init__", tracked_control_init)
-    monkeypatch.setattr(SQLiteExactBackend, "_connect", tracked_connect)
+    _when_imported(monkeypatch, "commonplace.control_db", track_control_db)
+    _when_imported(monkeypatch, "mempalace.backends.sqlite_exact", track_sqlite_exact)
     yield
     resources.close()
 
@@ -287,20 +379,37 @@ def _realign_default_backend(palace_module):
     keeps pointing at the closed original. Later tests then patch one object
     and the code under test uses the other.
     """
-    from mempalace.backends import registry
-    from mempalace.backends.chroma import ChromaBackend
+    registry = sys.modules.get("mempalace.backends.registry")
+    chroma = sys.modules.get("mempalace.backends.chroma")
+    if registry is None or chroma is None:
+        return
 
     current = registry.get_backend("chroma")
-    if isinstance(current, ChromaBackend) and current is not palace_module._DEFAULT_BACKEND:
+    if isinstance(current, chroma.ChromaBackend) and current is not palace_module._DEFAULT_BACKEND:
         palace_module._DEFAULT_BACKEND = current
+
+
+def _close_backend_clients(palace_module) -> None:
+    try:
+        _realign_default_backend(palace_module)
+        backend = getattr(palace_module, "_DEFAULT_BACKEND", None)
+        clients = getattr(backend, "_clients", None)
+        if clients:
+            for path in list(clients):
+                try:
+                    backend.close_palace(path)
+                except Exception:
+                    pass
+    except AttributeError:
+        pass
 
 
 @pytest.fixture(autouse=True)
 def _fresh_one_shot_warnings():
     """Let every test see the warnings that fire once per process."""
-    from mempalace import _once
-
-    _once.reset()
+    once = sys.modules.get("mempalace._once")
+    if once is not None:
+        once.reset()
 
 
 @pytest.fixture(autouse=True)
@@ -311,9 +420,11 @@ def _utc_local_zone(monkeypatch):
     """
     from datetime import timezone
 
-    from mempalace import timeutil
-
-    monkeypatch.setattr(timeutil, "_LOCAL_TZ", timezone.utc)
+    _when_imported(
+        monkeypatch,
+        "mempalace.timeutil",
+        lambda mod: monkeypatch.setattr(mod, "_LOCAL_TZ", timezone.utc),
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -334,8 +445,6 @@ def _reset_mcp_cache(monkeypatch, _close_test_storage_clients):
 
     def _clear_cache():
         try:
-            import sys
-
             mcp_server = sys.modules.get("mempalace.mcp_server")
             if mcp_server is not None:
                 stop_sync = getattr(mcp_server, "_stop_peer_sync_thread", None)
@@ -346,8 +455,8 @@ def _reset_mcp_cache(monkeypatch, _close_test_storage_clients):
                         pass
 
                 _reset_loaded_mcp_writer_state(mcp_server)
-                for kg in list(getattr(mcp_server, "_kg_by_path", {}).values()):
-                    close = getattr(kg, "close", None)
+                for graph in list(getattr(mcp_server, "_kg_by_path", {}).values()):
+                    close = getattr(graph, "close", None)
                     if close is not None:
                         try:
                             close()
@@ -390,22 +499,21 @@ def _reset_mcp_cache(monkeypatch, _close_test_storage_clients):
         except AttributeError:
             pass
 
-        try:
-            # Reset the per-process quarantine gate so tests don't leak
-            # state through ChromaBackend._quarantined_paths, and drop cached
-            # HNSW capacity verdicts (#1471) for the same reason — a test that
-            # reuses a palace path would otherwise inherit the previous test's
-            # verdict.
-            from mempalace.backends.chroma import ChromaBackend, reset_hnsw_capacity_cache
+        # Reset the per-process quarantine gate so tests don't leak state
+        # through ChromaBackend._quarantined_paths, and drop cached HNSW
+        # capacity verdicts (#1471) for the same reason — a test that reuses a
+        # palace path would otherwise inherit the previous test's verdict.
+        chroma = sys.modules.get("mempalace.backends.chroma")
+        if chroma is not None:
+            try:
+                chroma.ChromaBackend._quarantined_paths.clear()
+                chroma.reset_hnsw_capacity_cache()
+            except AttributeError:
+                pass
 
-            ChromaBackend._quarantined_paths.clear()
-            reset_hnsw_capacity_cache()
-        except (ImportError, AttributeError):
-            pass
-
-        from mempalace import search_util
-
-        search_util._known_wings_cache.clear()
+        search_util = sys.modules.get("mempalace.search_util")
+        if search_util is not None:
+            search_util._known_wings_cache.clear()
 
         # Release chromadb clients opened through the backend layer. Many tests
         # reach the store via palace.get_collection() (sweep, repair, CLI, ...),
@@ -416,20 +524,9 @@ def _reset_mcp_cache(monkeypatch, _close_test_storage_clients):
         # across the session until a later test's HNSW segment write fails
         # (#1128 Windows CI). close_palace() closes the client and drops the
         # handle without marking the backend closed, so it stays reusable.
-        try:
-            from mempalace import palace as _palace
-
-            _realign_default_backend(_palace)
-            backend = getattr(_palace, "_DEFAULT_BACKEND", None)
-            clients = getattr(backend, "_clients", None)
-            if clients:
-                for path in list(clients):
-                    try:
-                        backend.close_palace(path)
-                    except Exception:
-                        pass
-        except (ImportError, AttributeError):
-            pass
+        palace = sys.modules.get("mempalace.palace")
+        if palace is not None:
+            _close_backend_clients(palace)
 
     _clear_cache()
     yield
@@ -486,6 +583,8 @@ def config(tmp_dir, palace_path):
     cfg_dir = os.path.join(tmp_dir, "config")
     os.makedirs(cfg_dir)
     import json
+
+    from mempalace.config import MempalaceConfig
 
     with open(os.path.join(cfg_dir, "config.json"), "w") as f:
         json.dump({"palace_path": palace_path}, f)
@@ -574,6 +673,8 @@ def pytest_configure(config):
 @pytest.fixture
 def kg(tmp_dir):
     """An isolated KnowledgeGraph using a temp SQLite file."""
+    from mempalace.knowledge_graph import KnowledgeGraph
+
     db_path = os.path.join(tmp_dir, "test_kg.sqlite3")
     graph = KnowledgeGraph(db_path=db_path)
     yield graph
