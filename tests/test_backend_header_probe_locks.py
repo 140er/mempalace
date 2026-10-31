@@ -22,6 +22,7 @@ import os
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 
 import pytest
@@ -229,6 +230,84 @@ def test_probes_keep_chroma_writer_shared_lock(tmp_path):
     backend.close()
     del col
     assert _lock_released_within(db_path), "closing the writer releases the lock"
+
+
+@posix_only
+def test_concurrent_cold_probes_create_one_connection_and_keep_writer_lock(tmp_path, monkeypatch):
+    import chromadb
+
+    db_path = str(tmp_path / "chroma.sqlite3")
+    setup = sqlite3.connect(db_path)
+    setup.execute("PRAGMA journal_mode=WAL")
+    setup.close()
+    client = chromadb.PersistentClient(path=str(tmp_path))
+    collection = client.get_or_create_collection("probe-race", embedding_function=None)
+    collection.add(ids=["a"], documents=["alpha"], embeddings=[[1.0, 0.0]])
+    st = os.stat(db_path)
+    key = (st.st_dev, st.st_ino)
+    first_created, second_progress, resume = (threading.Event() for _ in range(3))
+    real_lock, real_connect = _magic._lock, sqlite3.connect
+    created_ids, thread_checks, results, errors = [], [], [], []
+
+    class ObservedLock:
+        def __enter__(self):
+            if not real_lock.acquire(blocking=False):
+                if threading.current_thread() is threads[1]:
+                    second_progress.set()
+                real_lock.acquire()
+
+        def __exit__(self, *exc):
+            real_lock.release()
+
+    def paused_connect(*args, **kwargs):
+        conn = real_connect(*args, **kwargs)
+        if threading.current_thread() in threads:
+            # Keep only identities: retaining either connection would hide an orphan's GC close.
+            created_ids.append(id(conn))
+            thread_checks.append(kwargs.get("check_same_thread"))
+            if threading.current_thread() is threads[0]:
+                first_created.set()
+                if not resume.wait(30):
+                    raise TimeoutError("first probe was not resumed")
+            else:
+                # The broken implementation reaches a second connect instead of waiting.
+                second_progress.set()
+        return conn
+
+    def probe():
+        try:
+            results.append(_magic.has_sqlite_magic(db_path))
+        except BaseException as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=probe) for _ in range(2)]
+    try:
+        assert key not in _magic._retained_conns and key not in _magic._positive
+        assert _shared_lock_held(db_path), "precondition: native writer holds SHARED"
+        monkeypatch.setattr(_magic, "_lock", ObservedLock())
+        monkeypatch.setattr(_magic.sqlite3, "connect", paused_connect)
+        try:
+            threads[0].start()
+            assert first_created.wait(30), "first probe did not open its connection"
+            threads[1].start()
+            assert second_progress.wait(30), "second probe did not reach the retention race"
+        finally:
+            resume.set()
+            for thread in threads:
+                if thread.ident is not None:
+                    thread.join(30)
+        assert not any(thread.is_alive() for thread in threads)
+        assert errors == [] and results == [True, True]
+        gc.collect()
+        assert (len(created_ids), len(_magic._retained_conns), _shared_lock_held(db_path)) == (
+            1,
+            1,
+            True,
+        )
+        assert id(_magic._retained_conns[key]) == created_ids[0]
+        assert thread_checks == [False]
+    finally:
+        client.close()
 
 
 @posix_only

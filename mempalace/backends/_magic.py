@@ -149,27 +149,31 @@ def has_sqlite_magic(db_path: str) -> bool:
             except sqlite3.Error:
                 _retained_conns.pop(key, None)
 
-    if st.st_size == 0:
-        return False
+        if st.st_size == 0:
+            return False
 
-    uri = sqlite_read_uri(db_path) + "&immutable=1"
-    try:
-        conn = sqlite3.connect(uri, uri=True)
-    except sqlite3.Error:
-        conn = None
-
-    if conn is not None:
+        # Check, create and retain under one lock. A competing cold probe must
+        # reuse this connection: replacing it would leave an orphan whose GC
+        # close can drop a native writer's process-wide POSIX locks.
+        uri = sqlite_read_uri(db_path) + "&immutable=1"
         try:
-            conn.execute("PRAGMA schema_version").fetchone()
-            with _lock:
+            # Retained probes may be closed by teardown after their creating
+            # thread has finished. Cached reads are serialized by _lock.
+            conn = sqlite3.connect(uri, uri=True, check_same_thread=False)
+        except sqlite3.Error:
+            conn = None
+
+        if conn is not None:
+            try:
+                conn.execute("PRAGMA schema_version").fetchone()
                 if os.name == "posix":
                     _retained_conns[key] = conn
                 else:
                     conn.close()
                 _positive[key] = True
-            return True
-        except sqlite3.Error:
-            conn.close()
+                return True
+            except sqlite3.Error:
+                conn.close()
 
     # SQLite refused the file (empty, truncated, garbage). Nothing SQLite
     # cannot open can be held open by a SQLite connection in this process, so
@@ -207,6 +211,6 @@ def close_retained() -> None:
         for conn in _retained_conns.values():
             try:
                 conn.close()
-            except Exception:
+            except OSError:
                 pass
         _retained_conns.clear()
