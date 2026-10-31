@@ -25,7 +25,7 @@ Card tools return short plain text, one fact per line. Chat tools return JSON wi
 | `task_add` | `title`, `body?`, `board?`, `status?` (`backlog` \| `todo`), `assignee?` | slim, standard, full |
 | `task_comment` | `task`, `text` | slim, standard, full |
 | `task_take_next` | `board?`, `task?` | standard, full |
-| `task_update` | `task`, `title?`, `body?`, `status?` (`backlog` \| `todo` \| `doing` \| `review` \| `done`), `before?`, `after?`, `link?`, `unlink?`, `lesson?` | standard, full |
+| `task_update` | `task`, `title?`, `body?`, `status?` (`backlog` \| `todo` \| `doing` \| `review` \| `done`), `before?`, `after?`, `link?`, `unlink?`, `lesson?`, `reason?` (review returns only) | standard, full |
 | `task_handoff` | `task`, `to`, `note`, `options?` | standard, full |
 | `needs_me` | `format?` (`list` \| `digest`) | slim, standard, full; owners or trusted, unrestricted member connections |
 
@@ -145,7 +145,7 @@ COMMIT;
 
 Only the holder of a `doing` card, or a person, may change it. Anyone else gets `no: #142 is held by conn:codex:vm until 14:30Z`.
 
-- Agents may move free or self-reserved `todo` cards to `review` or `done`, and held `doing` cards to `review` or `done`. A status-only update can reopen `done` to `todo`; other edits to completed cards remain blocked. Only the asking agent (`return_to` matches the caller) may close a `review` card with `status: "done"` (subject to `done_needs_review`), or keep it in `review`. Other exits from `review` require `decide`; agents cannot answer their own asks.
+- Agents may move free or self-reserved `todo` cards to `review` or `done`, and held `doing` cards to `review` or `done`. A status-only update can reopen `done` to `todo`; other edits to completed cards remain blocked. Only the asking agent (`return_to` matches the caller) may close a `review` card with `status: "done"` (subject to `done_needs_review`), or keep it in `review`. Withdrawal handling below is prepared for future agent-directed asks; person decisions require `decide`, and agents cannot answer their own asks.
 - Trusted, unrestricted board writers may promote an available `backlog` card to `todo`, or pick it up with `status=doing`. Restricted-origin cards require a person's release. Promotion preserves the caller's reservation. An open ask or a person in `assignee` or `ask_to` blocks agent moves. A person in `return_to` additionally blocks backlog pickup; stale return markers on released `todo` or `done` cards do not block normal moves or annotations.
 - Completed-card exception for trusted, unrestricted board writers: an update containing only `lesson`, `pr` and/or `link` may annotate a `done` card without reopening it. Optional `status=done` is accepted. Removing links and other edits stay frozen. These annotations emit the normal link history and `card.updated` event, preserving completion time and status.
 - `status: "done"` closes the card. On a board with `done_needs_review`, an agent's `done` moves the card to `review` instead, with the ask `Done?` and options `ship | redo`.
@@ -158,6 +158,47 @@ Only the holder of a `doing` card, or a person, may change it. Anyone else gets 
 ```
 ok #142 done  lesson drawer_a01c
 ```
+
+### Review feedback
+
+Trusted, unrestricted requester connections (`return_to`) with board write
+access may edit `title`, `body`, `checks`, `labels`, `link` and `unlink` on
+their `review` cards. Editing preserves the ask,
+options and recipient, so an ask addressed to a person remains in that
+person's `needs_me` queue. Other agents cannot edit or return the card.
+
+Current tools and HTTP routes create only person-directed review asks and
+clear the assignee. Assignee editing and agent-directed withdrawal handling
+are prepared for agent-to-agent review asks once such asks can be created;
+there is no public creation path for them today.
+
+For an agent-directed ask, the assignee or requester may move `review` to `todo`
+or `doing` by withdrawing its ask, with optional edits and a `reason` in the
+same update. The transaction clears `ask`, `ask_options`, `ask_to` and
+`return_to` together with the status change. It preserves the invariant that
+exactly the review cards have open asks. A person in `assignee`, `ask_to` or
+`return_to` blocks these moves; a missing recipient defaults to a person and
+also blocks them. The refusal is `waiting on a person, they must answer via decide`.
+A move to `doing` assigns the caller and starts the normal claim expiry.
+Only the requester may complete a review card, under the existing
+`done_needs_review` rule. An assignee who is not the requester cannot complete
+it. Agents still cannot answer their own asks through `decide`.
+
+Standard-trust connections gain none of these feedback permissions;
+untrusted and inbox-restricted connections remain excluded. Person rules
+are unchanged. Edits emit `edit` / `card.updated`; the event's `text` is JSON
+with the previous values of changed title, body, checks and labels, plus
+previous visible link IDs when links change. Returns additionally record
+a `release` task event containing the original ask text, options, recipient,
+optional verbatim `reason`, caller stamp, time and both statuses, plus a
+`card.ask_withdrawn` notification and the normal `move` / `card.moved` event.
+Notification payloads carry references; the original ask and reason remain
+in the card's history. Withdrawal never records a `decide` event and does
+not answer the ask. `reason` is accepted only on these review returns; an
+empty or omitted reason is stored as `NULL`.
+
+Link IDs in history are filtered by the reader's memory access, including
+links since removed from the card. Stored audit snapshots remain unchanged.
 
 ### task_handoff
 
@@ -188,7 +229,7 @@ An agent can also hand off a card it does not hold, but only from `todo`, only w
 | doing → review | `task_update` or `task_handoff` to a person (holder) | yes |
 | doing → done | `task_update` (holder) | yes |
 | review → done | `task_update` (asking agent only; subject to `done_needs_review`) | `decide` only |
-| review → other columns | `decide` only (never own asks) | `decide` only |
+| review → todo / doing | person decisions require `decide` (never own asks); withdrawal by a trusted assignee/requester is prepared for future agent-directed asks | `decide` only |
 | todo → review | `task_update` or `task_handoff` to a person (free or self-reserved) | yes |
 | todo → done | `task_update` | no |
 | done → todo | status-only `task_update` | yes |
@@ -268,6 +309,10 @@ All bodies are JSON. Writes send the card's `version`; a stale one gets `409` wi
 | `GET /app/api/search?q=` | ⌘K: tasks and drawers together, in the user's scopes. |
 
 ### decide
+
+MCP accepts an optional integer `version`. Send the version read from the card
+to reject a decision if feedback has since changed it. HTTP requires `version`.
+A version clash leaves the open ask and card unchanged.
 
 ```json
 { "version": 7, "choice": "90d", "reply": "Go with 90 days, keep 1 year as an option.", "then": "return" }

@@ -71,6 +71,13 @@ The hub only stores and wakes. Replies posted with `space_post` do not trigger w
 - On boards that need review, the card goes to the user as "Done?" instead.
 - Trusted board writers may add `lesson`, `pr` or `link` to a `done` card without
   reopening it. Removing links and other edits to completed cards remain blocked.
+- Trusted board writers may edit title, body, checks, labels and memory links
+  on review cards they requested. Open asks stay with the user; history keeps
+  prior edited values. Current tools create only person-directed reviews.
+  Assignee edits and withdrawal to `todo`/`doing` are prepared for agent-to-agent
+  review asks once those can be created. Person-directed asks cannot be withdrawn.
+  Only the requester may complete a review; never answer your own ask. When
+  answering, pass the card's read `version` to `decide` to reject a stale decision.
 
 ## Decisions
 

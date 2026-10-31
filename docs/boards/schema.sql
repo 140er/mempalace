@@ -1,4 +1,6 @@
 -- Commonplace boards: data model
+-- Illustrative design sketch, not the executable schema.
+-- See commonplace/boards/schema.sql and commonplace/boards/store.py for the current schema and migrations.
 -- SQLite, one file per workspace: <palace>/boards.sqlite3, next to the knowledge graph.
 -- Design: docs/boards/DESIGN.md. API: docs/boards/API.md.
 --

@@ -11,7 +11,7 @@ who asked whom).
 Kinds in use (add, never rename):
 
     card.created  card.updated  card.moved  card.commented  card.claimed
-    card.expired  card.handoff  card.review_needed  card.decided
+    card.expired  card.handoff  card.review_needed  card.decided  card.ask_withdrawn
     memory.saved  memory.linked  fact.saved
     webhook.failed
 """

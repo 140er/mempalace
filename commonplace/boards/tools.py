@@ -75,6 +75,8 @@ def show(c):
         rows += tree(c["callstack"])
     for event in c["events"][-10:]:
         rows.append(f"- {event['at']} {event['actor']} {event['kind']}: {quoted(event['text'])}")
+        if event.get("reason"):
+            rows.append(f"  reason: {quoted(event['reason'])}")
     if c["linked"]:
         rows.append(
             "memories: "
@@ -195,12 +197,13 @@ def add(
                 "task_comment": "Append a comment and renew your claim.",
                 "task_take_next": "Claim a todo card reserved for you or free for anyone. Trusted agents may also claim a backlog card by task number; restricted submissions and cards awaiting a person are excluded.",
                 "task_update": "Update a card, move todo/held doing to review or done, or close your own review card with done. "
+                "Trusted requesters may edit their review details while preserving the open ask. Assignee edits and ask withdrawal to todo/doing are prepared for future agent-directed reviews; current APIs create person-directed reviews, which cannot be withdrawn. "
                 "Reopen done to todo (status only). Save a lesson with done. "
                 "Trusted agents may move available backlog cards of unrestricted origin to todo or doing and add lessons, PR links or memory links to done cards. "
                 "callstack takes the JSON from python -m commonplace.callstack.",
                 "task_handoff": "Hand off work with a note, or ask a person and end the turn.",
                 "ask": "Ask the workspace owner and end the turn.",
-                "decide": "Answer a review and return, release, close or park the card.",
+                "decide": "Answer a review and return, release, close or park the card. Pass the version you read to reject decisions on an edited card.",
                 "needs_me": "Read the visible decision queue (owners or trusted, unrestricted member connections; read only).",
             }[name],
             input_schema={
@@ -302,6 +305,7 @@ def register_tools():
                     "branch",
                     "checks",
                     "status_line",
+                    "reason",
                 )
             },
         },
@@ -330,6 +334,7 @@ def register_tools():
         "decide",
         {
             "task": TASK,
+            "version": {"type": "integer"},
             "choice": STRING,
             "reply": STRING,
             "then": {"type": "string", "enum": ["return", "todo", "done", "backlog"]},

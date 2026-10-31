@@ -121,13 +121,14 @@ def card(conn, row, principal=None) -> dict:
 
 def append_event(conn, number, kind, actor, *, trust="trusted", **fields):
     conn.execute(
-        "INSERT INTO task_events(task_id,kind,text,from_status,to_status,target,choice,options,"
+        "INSERT INTO task_events(task_id,kind,text,reason,from_status,to_status,target,choice,options,"
         "stamp_user,stamp_connection,stamp_trust,flags,created_at) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (
             number,
             kind,
             fields.get("text"),
+            fields.get("reason"),
             fields.get("from_status"),
             fields.get("to_status"),
             fields.get("target"),
@@ -220,6 +221,8 @@ class BoardStore:
                 event_columns = {r[1] for r in conn.execute("PRAGMA table_info(task_events)")}
                 if "options" not in event_columns:
                     conn.execute("ALTER TABLE task_events ADD COLUMN options TEXT")
+                if "reason" not in event_columns:
+                    conn.execute("ALTER TABLE task_events ADD COLUMN reason TEXT")
                 link_columns = {r[1] for r in conn.execute("PRAGMA table_info(task_links)")}
                 if "title" not in link_columns:
                     conn.execute("ALTER TABLE task_links ADD COLUMN title TEXT NOT NULL DEFAULT ''")

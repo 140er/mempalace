@@ -35,7 +35,7 @@ backlog │ todo │ doing │ review │ done
 | `backlog` | Ideas, and anything filed by an `inbox` token. Trusted, unrestricted board writers may promote or explicitly take available cards of unrestricted origin without a pending person decision. | Untrusted tokens and cloud clients (always), anyone (on purpose) |
 | `todo` | Ready work. A card may be reserved for one agent. | People (from backlog or new), trusted and standard agents, decisions |
 | `doing` | Held by exactly one actor. An agent's hold expires. | `task_take_next`, or a person dragging a card |
-| `review` | Waiting on a person: a question, or finished work to check. | `task_handoff` to a person |
+| `review` | An open ask to a person: a question, or finished work to check. | `ask`, `task_update`, or `task_handoff` to a person |
 | `done` | Closed. Never deleted. | The holder, a person, or a decision |
 
 `review` is the one column added to kanzo's set. A question to Avery could have been a flag on a `doing` card, but then waiting work looks like moving work, and the claim keeps ticking on a card nobody can move. A column makes waiting visible on the board and gives the decide queue a single query.
@@ -54,9 +54,30 @@ backlog │ todo │ doing │ review │ done
 
 The full table of who may make each move is in [API.md](API.md#move-rules). Three rules carry the design:
 
-- **People and trusted, unrestricted board writers may move available cards out of `backlog`; restricted-origin submissions and cards waiting on a person require a person.** Origin restrictions are recorded when a card is filed, including trusted inbox submissions. Legacy agent backlog uses its trust stamp and the stamping connection's current policy in the same workspace; untrusted stamps and missing, inactive or ambiguous origins remain person-only. Automatic pickup stays on `todo`, and backlog promotion preserves the caller's reservation. Only the asking agent may close a `review` card via `task_update`; other review exits require `decide`. An agent can never answer its own question. Untrusted and inbox-restricted connections still only submit cards and comments.
+- **People and trusted, unrestricted board writers may move available cards out of `backlog`; restricted-origin submissions and cards waiting on a person require a person.** Origin restrictions are recorded when a card is filed, including trusted inbox submissions. Legacy agent backlog uses its trust stamp and the stamping connection's current policy in the same workspace; untrusted stamps and missing, inactive or ambiguous origins remain person-only. Automatic pickup stays on `todo`, and backlog promotion preserves the caller's reservation. Only the asking agent may close a `review` card via `task_update`; person-directed review returns require `decide`. Withdrawal handling is prepared for future agent-directed asks under the rules below. An agent can never answer its own question. Untrusted and inbox-restricted connections still only submit cards and comments.
 - **Only the holder changes a `doing` card.** Others can comment.
 - **Cards are never deleted.** Closing one with a reason is a move to `done`. The event log is append-only (enforced by triggers in `schema.sql`).
+
+Trusted, unrestricted board writers may edit title, body, checks, labels and
+memory links on review cards they requested, preserving the open ask. The
+edit event keeps prior changed values as JSON, including visible link IDs.
+MCP decisions may supply the version read to reject a stale answer after an edit.
+
+Current tools and HTTP routes create only person-directed reviews and clear
+the assignee. Assignee edits and withdrawal are prepared for agent-to-agent
+review asks once a creation path exists. For such asks, the assignee or
+requester may return an agent-directed review
+to `todo` or `doing` by withdrawing its ask in the same transaction. Person
+recipients (including the default owner), person assignees and person return
+targets block withdrawal and keep their decision queue intact. Only the
+requester may complete a review card, and `decide` still refuses an agent's
+own ask.
+
+Withdrawal preserves the review/open-ask database constraint. A `release`
+event stores the original ask and optional verbatim reason, with actor, time,
+recipient, options and statuses. `card.ask_withdrawn` notifies readers alongside
+the normal move event; it does not record or imply an answer. Standard-trust,
+untrusted and inbox-restricted agents gain no feedback permissions.
 
 ## How agents claim
 

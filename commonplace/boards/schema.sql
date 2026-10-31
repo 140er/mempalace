@@ -101,6 +101,7 @@ CREATE TABLE IF NOT EXISTS task_events (
                    'add', 'edit', 'move', 'comment', 'claim', 'renew', 'release',
                    'expire', 'handoff', 'ask', 'decide', 'link', 'unlink')),
     text       TEXT,                                -- verbatim comment, handoff note, ask or reply
+    reason     TEXT,                                -- optional verbatim reason for withdrawing an ask
     from_status TEXT,
     to_status   TEXT,
     target     TEXT,                                -- actor ref (handoff, assign) or drawer id (link)
